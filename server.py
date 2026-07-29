@@ -148,6 +148,71 @@ class ChatConnectionManager:
 chat_manager = ChatConnectionManager()
 
 
+class PresenceManager:
+    """Mantém uma conexão viva por membro logado (enquanto ele estiver em
+    qualquer tela do app) para poder avisar sobre chamadas recebidas em
+    tempo real — v2.0 (Chamadas)."""
+
+    def __init__(self):
+        self.connections: dict[str, set[WebSocket]] = {}
+
+    async def join(self, member_id: str, ws: WebSocket):
+        self.connections.setdefault(member_id, set()).add(ws)
+
+    def leave(self, member_id: str, ws: WebSocket):
+        if member_id in self.connections:
+            self.connections[member_id].discard(ws)
+            if not self.connections[member_id]:
+                del self.connections[member_id]
+
+    async def notify(self, member_id: str, payload: dict):
+        for ws in list(self.connections.get(member_id, [])):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                self.leave(member_id, ws)
+
+    def is_online(self, member_id: str) -> bool:
+        return bool(self.connections.get(member_id))
+
+
+presence_manager = PresenceManager()
+
+
+class CallSignalManager:
+    """Retransmite mensagens de sinalização WebRTC (SDP/ICE) entre os
+    participantes de uma sala de chamada — v2.0. O servidor nunca vê áudio
+    ou vídeo: apenas ajuda os navegadores a se encontrarem (a mídia viaja
+    diretamente entre os aparelhos, peer-to-peer)."""
+
+    def __init__(self):
+        self.rooms: dict[str, dict[str, WebSocket]] = {}
+
+    async def join(self, room_id: str, member_id: str, ws: WebSocket):
+        self.rooms.setdefault(room_id, {})[member_id] = ws
+
+    def leave(self, room_id: str, member_id: str):
+        if room_id in self.rooms:
+            self.rooms[room_id].pop(member_id, None)
+            if not self.rooms[room_id]:
+                del self.rooms[room_id]
+
+    async def relay(self, room_id: str, from_member_id: str, payload: dict):
+        for member_id, ws in list(self.rooms.get(room_id, {}).items()):
+            if member_id == from_member_id:
+                continue
+            try:
+                await ws.send_json({**payload, "from": from_member_id})
+            except Exception:
+                self.leave(room_id, member_id)
+
+    def participants(self, room_id: str) -> list:
+        return list(self.rooms.get(room_id, {}).keys())
+
+
+call_signal_manager = CallSignalManager()
+
+
 def user_role(user: dict) -> str:
     if user.get("is_admin"):
         return "admin"
@@ -332,6 +397,19 @@ class ChatMessageIn(BaseModel):
 class MuteIn(BaseModel):
     member_id: str
     minutes: int = 60
+
+
+# ------------------------ Chamadas (v2.0 — WebRTC) ------------------------
+
+class CallStartIn(BaseModel):
+    call_type: str = "audio"  # audio | video
+    mode: str = "direct"  # direct (1 para 1) | group (reunião)
+    target_member_id: Optional[str] = None  # obrigatório se mode == "direct"
+    title: Optional[str] = ""  # usado em reuniões (mode == "group")
+
+
+class CallInviteIn(BaseModel):
+    member_id: str
 
 
 # ------------------------ Seed ------------------------
@@ -1105,7 +1183,7 @@ async def global_search(q: str, admin=Depends(require_admin)):
 
 @api_router.get("/admin/backup")
 async def export_backup(admin=Depends(require_admin)):
-    collections = ["members", "settings", "payments", "events", "notices", "news_posts", "gallery_albums", "receipts", "audit_logs", "chat_messages", "webauthn_credentials"]
+    collections = ["members", "settings", "payments", "events", "notices", "news_posts", "gallery_albums", "receipts", "audit_logs", "chat_messages", "webauthn_credentials", "calls"]
     data = {}
     for name in collections:
         data[name] = await db[name].find({}, {"_id": 0}).to_list(10000)
@@ -1619,6 +1697,168 @@ async def webauthn_login_verify(data: WebAuthnLoginVerifyIn, user=Depends(get_cu
     await db.webauthn_credentials.update_one({"id": stored["id"]}, {"$set": {"sign_count": verification.new_sign_count}})
     await db.members.update_one({"id": user["id"]}, {"$unset": {"webauthn_challenge": ""}})
     return {"ok": True}
+
+
+# ============================================================
+#  Chamadas (v2.0) — voz/vídeo com WebRTC (sinalização via WebSocket)
+# ============================================================
+# O servidor NUNCA processa áudio/vídeo — apenas ajuda os participantes a
+# trocarem as informações necessárias (SDP/ICE) para se conectarem
+# diretamente entre si. Isso mantém o uso de recursos do Render mínimo,
+# mesmo em chamadas longas.
+
+# Servidores STUN/TURN gratuitos usados para atravessar NAT/firewall.
+# STUN público do Google (sem custo, sem limite prático de uso).
+# TURN: usa o serviço gratuito do Open Relay Project (cota generosa, sem
+# cartão de crédito) como retaguarda para redes mais restritas. Se preferir
+# outro provedor no futuro, basta trocar aqui — nada mais no código muda.
+ICE_SERVERS = [
+    {"urls": ["stun:stun.l.google.com:19302", "stun:global.stun.twilio.com:3478"]},
+    {
+        "urls": ["turn:openrelay.metered.ca:80", "turn:openrelay.metered.ca:443"],
+        "username": "openrelayproject",
+        "credential": "openrelayproject",
+    },
+]
+
+
+@api_router.get("/members/admins")
+async def list_admins(user=Depends(get_current_user)):
+    """Lista mínima de administradores — usada pelo membro para saber para
+    quem ligar ao chamar 'a administração' (Chamadas — v2.0)."""
+    admins = await db.members.find({"is_admin": True}, {"_id": 0, "id": 1, "name": 1, "photo": 1}).to_list(20)
+    return admins
+
+
+@api_router.get("/calls/ice-servers")
+async def get_ice_servers(user=Depends(get_current_user)):
+    return {"iceServers": ICE_SERVERS}
+
+
+@api_router.post("/calls")
+async def start_call(data: CallStartIn, user=Depends(get_current_user)):
+    role = user_role(user)
+    if role == "visitor":
+        raise HTTPException(status_code=403, detail="Visitantes não têm acesso a chamadas")
+    if data.mode == "direct":
+        if not data.target_member_id:
+            raise HTTPException(status_code=400, detail="Informe o membro para chamar")
+        target = await db.members.find_one({"id": data.target_member_id}, {"_id": 0})
+        if not target:
+            raise HTTPException(status_code=404, detail="Membro não encontrado")
+        participants_planned = [user["id"], data.target_member_id]
+    else:
+        participants_planned = [user["id"]]
+
+    call = {
+        "id": str(uuid.uuid4()),
+        "call_type": data.call_type if data.call_type in ("audio", "video") else "audio",
+        "mode": data.mode if data.mode in ("direct", "group") else "direct",
+        "title": (data.title or "").strip(),
+        "created_by": user["id"],
+        "created_by_name": user.get("name", ""),
+        "participants_planned": participants_planned,
+        "participants_joined": [],
+        "status": "ringing",
+        "created_at": now_iso(),
+        "ended_at": None,
+    }
+    await db.calls.insert_one(call)
+    call.pop("_id", None)
+
+    if data.mode == "direct":
+        await presence_manager.notify(data.target_member_id, {
+            "event": "incoming_call", "call": call,
+        })
+    return call
+
+
+@api_router.post("/calls/{call_id}/invite")
+async def invite_to_call(call_id: str, data: CallInviteIn, user=Depends(get_current_user)):
+    call = await db.calls.find_one({"id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="Chamada não encontrada")
+    await db.calls.update_one({"id": call_id}, {"$addToSet": {"participants_planned": data.member_id}})
+    call["participants_planned"] = list(set(call.get("participants_planned", []) + [data.member_id]))
+    call.pop("_id", None)
+    await presence_manager.notify(data.member_id, {"event": "incoming_call", "call": call})
+    return {"ok": True}
+
+
+@api_router.post("/calls/{call_id}/join")
+async def join_call(call_id: str, user=Depends(get_current_user)):
+    result = await db.calls.update_one(
+        {"id": call_id},
+        {"$addToSet": {"participants_joined": user["id"]}, "$set": {"status": "active"}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chamada não encontrada")
+    return {"ok": True}
+
+
+@api_router.post("/calls/{call_id}/leave")
+async def leave_call(call_id: str, user=Depends(get_current_user)):
+    call = await db.calls.find_one({"id": call_id})
+    if not call:
+        raise HTTPException(status_code=404, detail="Chamada não encontrada")
+    joined = [p for p in call.get("participants_joined", []) if p != user["id"]]
+    patch = {"participants_joined": joined}
+    if not joined:
+        patch["status"] = "ended"
+        patch["ended_at"] = now_iso()
+    await db.calls.update_one({"id": call_id}, {"$set": patch})
+    call_signal_manager.leave(call_id, user["id"])
+    return {"ok": True}
+
+
+@api_router.get("/calls/{call_id}")
+async def get_call(call_id: str, user=Depends(get_current_user)):
+    call = await db.calls.find_one({"id": call_id}, {"_id": 0})
+    if not call:
+        raise HTTPException(status_code=404, detail="Chamada não encontrada")
+    return call
+
+
+@api_router.websocket("/ws/call/{room_id}")
+async def ws_call_signal(websocket: WebSocket, room_id: str, token: str = Query(...)):
+    """Canal de sinalização: retransmite SDP/ICE entre os participantes da
+    sala. Nunca transporta áudio/vídeo (isso vai direto entre os navegadores)."""
+    user = await get_user_from_ws_token(token)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    if user_role(user) == "visitor":
+        await websocket.close(code=4403)
+        return
+    await websocket.accept()
+    await call_signal_manager.join(room_id, user["id"], websocket)
+    try:
+        while True:
+            payload = await websocket.receive_json()
+            await call_signal_manager.relay(room_id, user["id"], payload)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        call_signal_manager.leave(room_id, user["id"])
+
+
+@api_router.websocket("/ws/presence")
+async def ws_presence(websocket: WebSocket, token: str = Query(...)):
+    """Conexão de presença: mantida aberta enquanto o membro está no app,
+    usada para avisar sobre chamadas recebidas em tempo real — v2.0."""
+    user = await get_user_from_ws_token(token)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    await presence_manager.join(user["id"], websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # canal só de notificação; ignora entrada
+    except WebSocketDisconnect:
+        pass
+    finally:
+        presence_manager.leave(user["id"], websocket)
 
 
 # Include router

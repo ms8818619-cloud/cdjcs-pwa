@@ -3,7 +3,6 @@ services:
     name: cdjcs-api
     runtime: python
     plan: free
-    rootDir: backend
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
@@ -17,3 +16,10 @@ services:
         value: "13480937497"
       - key: CORS_ORIGINS
         value: "*"
+      # Credencial Digital — biometria (WebAuthn). Ajuste para o domínio real
+      # do frontend publicado (ex: "seusite.netlify.app"), sem "https://".
+      # Sem isso, a biometria não funciona, mas o resto do app funciona normalmente.
+      - key: WEBAUTHN_RP_ID
+        value: "localhost"
+      - key: WEBAUTHN_ORIGIN
+        value: "https://localhost"
