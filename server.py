@@ -378,6 +378,49 @@ class ReceiptIn(BaseModel):
     notes: Optional[str] = ""
 
 
+# ------------------------ Feed & Stories (v2.x) ------------------------
+# "composition" guarda o resultado do Compositor de Publicações do frontend:
+# posição/tamanho/rotação da mídia, textos, emojis e figurinhas — permite
+# reabrir/editar a publicação exatamente como foi montada. O backend não
+# interpreta esse conteúdo, apenas armazena e devolve como veio.
+
+class CompositionElement(BaseModel):
+    kind: str  # "text" | "emoji" | "sticker"
+    content: str  # texto em si, o emoji, ou a URL/id da figurinha
+    x: float = 50  # posição em % da largura
+    y: float = 50  # posição em % da altura
+    scale: float = 1.0
+    rotation: float = 0
+    font_size: Optional[int] = None
+    color: Optional[str] = None
+
+
+class FeedPostIn(BaseModel):
+    media_type: str = "photo"  # photo | video | text
+    media: Optional[str] = ""  # data URL da foto/vídeo (vazio se for só texto)
+    media_transform: Optional[dict] = None  # {x, y, scale, rotation} aplicado à mídia no compositor
+    caption: Optional[str] = ""
+    elements: List[CompositionElement] = []  # textos/emojis/figurinhas posicionados
+    audience: Optional[str] = "all"
+    music_track: Optional[dict] = None  # reservado p/ integração futura (ver /music)
+
+
+class StoryIn(BaseModel):
+    media_type: str = "photo"  # photo | video
+    media: str
+    media_transform: Optional[dict] = None
+    elements: List[CompositionElement] = []
+    music_track: Optional[dict] = None
+
+
+class CommentIn(BaseModel):
+    body: str
+
+
+class MusicConnectIn(BaseModel):
+    provider: str = "spotify"  # preparado para múltiplos serviços no futuro
+
+
 # ------------------------ Chat (v2.0) ------------------------
 # Estrutura: 1 Grupo dos Membros (membros + admins) + conversas privadas
 # individuais (qualquer membro/visitante <-> administração). Sem grupo de
@@ -448,6 +491,21 @@ async def log_action(actor: dict, action: str, details: str = ""):
 
 
 async def seed_defaults():
+    # Política de retenção — v2.x: mensagens do Chat são apagadas automaticamente
+    # pelo próprio MongoDB 72h (3 dias) após o envio, sem precisar de nenhuma
+    # rotina/cron separada — o índice TTL cuida disso sozinho no servidor.
+    # (idempotente: recriar o índice com os mesmos parâmetros não tem efeito colateral)
+    try:
+        await db.chat_messages.create_index("expires_at", expireAfterSeconds=72 * 3600)
+    except Exception:
+        logging.getLogger(__name__).exception("Falha ao criar índice TTL do chat")
+
+    try:
+        # Stories somem sozinhos 24h após a publicação — mesmo mecanismo do chat.
+        await db.stories.create_index("expires_at", expireAfterSeconds=24 * 3600)
+    except Exception:
+        logging.getLogger(__name__).exception("Falha ao criar índice TTL das Stories")
+
     # Settings
     if not await db.settings.find_one({"key": "app"}):
         await db.settings.insert_one({
@@ -1183,7 +1241,7 @@ async def global_search(q: str, admin=Depends(require_admin)):
 
 @api_router.get("/admin/backup")
 async def export_backup(admin=Depends(require_admin)):
-    collections = ["members", "settings", "payments", "events", "notices", "news_posts", "gallery_albums", "receipts", "audit_logs", "chat_messages", "webauthn_credentials", "calls"]
+    collections = ["members", "settings", "payments", "events", "notices", "news_posts", "gallery_albums", "receipts", "audit_logs", "chat_messages", "webauthn_credentials", "calls", "feed_posts", "feed_comments", "stories", "music_connections"]
     data = {}
     for name in collections:
         data[name] = await db[name].find({}, {"_id": 0}).to_list(10000)
@@ -1397,6 +1455,7 @@ async def _persist_and_broadcast(user: dict, data: ChatMessageIn):
         "reply_to": data.reply_to,
         "deleted": False,
         "created_at": now_iso(),
+        "expires_at": datetime.now(timezone.utc),  # Política de retenção — v2.x: mensagens somem sozinhas após 72h (ver índice TTL no startup)
     }
     await db.chat_messages.insert_one(dict(msg))
     out = _msg_out(msg)
@@ -1859,6 +1918,224 @@ async def ws_presence(websocket: WebSocket, token: str = Query(...)):
         pass
     finally:
         presence_manager.leave(user["id"], websocket)
+
+
+# ============================================================
+#  Feed & Stories (v2.x)
+# ============================================================
+# Feed: permanente (só apaga por ação do autor/admin). Stories: some sozinho
+# em 24h (índice TTL criado no startup — ver seed_defaults).
+
+def _feed_visible_query(role: str) -> dict:
+    return {"$or": [{"audience": {"$in": visible_to(role)}}, {"audience": {"$exists": False}}]}
+
+
+@api_router.get("/feed")
+async def list_feed(user=Depends(get_current_user), limit: int = 20, before: Optional[str] = None):
+    role = user_role(user)
+    q = _feed_visible_query(role)
+    if before:
+        q = {"$and": [q, {"created_at": {"$lt": before}}]}
+    limit = min(max(limit, 1), 50)
+    posts = await db.feed_posts.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    for p in posts:
+        p["like_count"] = len(p.get("likes", []))
+        p["liked_by_me"] = user["id"] in p.get("likes", [])
+        p["comment_count"] = await db.feed_comments.count_documents({"post_id": p["id"]})
+        p.pop("likes", None)
+    return posts
+
+
+@api_router.get("/public/feed")
+async def public_feed(limit: int = 20):
+    q = _feed_visible_query("visitor")
+    limit = min(max(limit, 1), 50)
+    posts = await db.feed_posts.find(q, {"_id": 0}).sort("created_at", -1).to_list(limit)
+    for p in posts:
+        p["like_count"] = len(p.get("likes", []))
+        p["comment_count"] = await db.feed_comments.count_documents({"post_id": p["id"]})
+        p.pop("likes", None)
+    return posts
+
+
+@api_router.post("/feed")
+async def create_feed_post(data: FeedPostIn, user=Depends(get_current_user)):
+    if user_role(user) == "visitor":
+        raise HTTPException(status_code=403, detail="Visitantes não publicam no Feed")
+    audience = data.audience if data.audience in AUDIENCE_VALUES else "all"
+    doc = {
+        "id": str(uuid.uuid4()),
+        "author_id": user["id"],
+        "author_name": user.get("name", ""),
+        "author_photo": user.get("photo"),
+        "media_type": data.media_type,
+        "media": data.media or "",
+        "media_transform": data.media_transform or {},
+        "caption": (data.caption or "").strip(),
+        "elements": [e.dict() for e in data.elements],
+        "music_track": data.music_track,
+        "audience": audience,
+        "likes": [],
+        "created_at": now_iso(),
+    }
+    await db.feed_posts.insert_one(dict(doc))
+    doc.pop("_id", None)
+    await log_action(user, f"Publicou no Feed", f"post {doc['id']}")
+    return doc
+
+
+@api_router.put("/feed/{post_id}")
+async def update_feed_post(post_id: str, data: FeedPostIn, user=Depends(get_current_user)):
+    post = await db.feed_posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Publicação não encontrada")
+    if post["author_id"] != user["id"] and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Sem permissão para editar esta publicação")
+    audience = data.audience if data.audience in AUDIENCE_VALUES else "all"
+    patch = {
+        "media_type": data.media_type, "media": data.media or "", "media_transform": data.media_transform or {},
+        "caption": (data.caption or "").strip(), "elements": [e.dict() for e in data.elements],
+        "music_track": data.music_track, "audience": audience,
+    }
+    await db.feed_posts.update_one({"id": post_id}, {"$set": patch})
+    return await db.feed_posts.find_one({"id": post_id}, {"_id": 0})
+
+
+@api_router.delete("/feed/{post_id}")
+async def delete_feed_post(post_id: str, user=Depends(get_current_user)):
+    post = await db.feed_posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Publicação não encontrada")
+    if post["author_id"] != user["id"] and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Sem permissão para excluir esta publicação")
+    await db.feed_posts.delete_one({"id": post_id})
+    await db.feed_comments.delete_many({"post_id": post_id})
+    if user.get("is_admin") and post["author_id"] != user["id"]:
+        await log_action(user, "Removeu publicação do Feed de outro autor", f"post {post_id}")
+    return {"ok": True}
+
+
+@api_router.post("/feed/{post_id}/like")
+async def toggle_like(post_id: str, user=Depends(get_current_user)):
+    post = await db.feed_posts.find_one({"id": post_id})
+    if not post:
+        raise HTTPException(status_code=404, detail="Publicação não encontrada")
+    likes = post.get("likes", [])
+    if user["id"] in likes:
+        await db.feed_posts.update_one({"id": post_id}, {"$pull": {"likes": user["id"]}})
+        return {"liked": False}
+    await db.feed_posts.update_one({"id": post_id}, {"$addToSet": {"likes": user["id"]}})
+    return {"liked": True}
+
+
+@api_router.get("/feed/{post_id}/comments")
+async def list_comments(post_id: str, user=Depends(get_current_user)):
+    return await db.feed_comments.find({"post_id": post_id}, {"_id": 0}).sort("created_at", 1).to_list(500)
+
+
+@api_router.post("/feed/{post_id}/comments")
+async def add_comment(post_id: str, data: CommentIn, user=Depends(get_current_user)):
+    if not await db.feed_posts.find_one({"id": post_id}):
+        raise HTTPException(status_code=404, detail="Publicação não encontrada")
+    comment = {
+        "id": str(uuid.uuid4()), "post_id": post_id, "author_id": user["id"],
+        "author_name": user.get("name", ""), "body": data.body.strip(), "created_at": now_iso(),
+    }
+    await db.feed_comments.insert_one(dict(comment))
+    comment.pop("_id", None)
+    return comment
+
+
+@api_router.delete("/feed/comments/{comment_id}")
+async def delete_comment(comment_id: str, user=Depends(get_current_user)):
+    comment = await db.feed_comments.find_one({"id": comment_id})
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comentário não encontrado")
+    if comment["author_id"] != user["id"] and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Sem permissão para excluir este comentário")
+    await db.feed_comments.delete_one({"id": comment_id})
+    return {"ok": True}
+
+
+# ------------------------ Stories (expiram em 24h) ------------------------
+
+@api_router.get("/stories")
+async def list_stories(user=Depends(get_current_user)):
+    role = user_role(user)
+    q = {"$or": [{"audience": {"$in": visible_to(role)}}, {"audience": {"$exists": False}}]}
+    items = await db.stories.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
+    return items
+
+
+@api_router.get("/public/stories")
+async def public_stories():
+    q = {"$or": [{"audience": {"$in": visible_to('visitor')}}, {"audience": {"$exists": False}}]}
+    return await db.stories.find(q, {"_id": 0}).sort("created_at", -1).to_list(200)
+
+
+@api_router.post("/stories")
+async def create_story(data: StoryIn, user=Depends(get_current_user)):
+    if user_role(user) == "visitor":
+        raise HTTPException(status_code=403, detail="Visitantes não publicam Stories")
+    doc = {
+        "id": str(uuid.uuid4()),
+        "author_id": user["id"],
+        "author_name": user.get("name", ""),
+        "author_photo": user.get("photo"),
+        "media_type": data.media_type,
+        "media": data.media,
+        "media_transform": data.media_transform or {},
+        "elements": [e.dict() for e in data.elements],
+        "music_track": data.music_track,
+        "audience": "all",
+        "views": [],
+        "created_at": now_iso(),
+        "expires_at": datetime.now(timezone.utc),  # TTL — some sozinho em 24h
+    }
+    await db.stories.insert_one(dict(doc))
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.post("/stories/{story_id}/view")
+async def view_story(story_id: str, user=Depends(get_current_user)):
+    await db.stories.update_one({"id": story_id}, {"$addToSet": {"views": user["id"]}})
+    return {"ok": True}
+
+
+@api_router.delete("/stories/{story_id}")
+async def delete_story(story_id: str, user=Depends(get_current_user)):
+    story = await db.stories.find_one({"id": story_id})
+    if not story:
+        raise HTTPException(status_code=404, detail="Story não encontrado")
+    if story["author_id"] != user["id"] and not user.get("is_admin"):
+        raise HTTPException(status_code=403, detail="Sem permissão para excluir este Story")
+    await db.stories.delete_one({"id": story_id})
+    return {"ok": True}
+
+
+# ------------------------ Música (preparação para integração futura) ------------------------
+# Sem catálogo próprio, sem armazenar música nenhuma. Só guarda se o membro já
+# conectou a conta (via OAuth, quando essa etapa for implementada) e o
+# provedor escolhido — a associação da faixa em si acontece no app do
+# provedor, respeitando os limites da API dele.
+
+@api_router.get("/music/status")
+async def music_status(user=Depends(get_current_user)):
+    conn = await db.music_connections.find_one({"member_id": user["id"]}, {"_id": 0})
+    return conn or {"member_id": user["id"], "connected": False, "provider": None}
+
+
+@api_router.post("/music/connect-placeholder")
+async def music_connect_placeholder(data: MusicConnectIn, user=Depends(get_current_user)):
+    """Reserva a estrutura para quando a integração OAuth real existir —
+    ainda não conecta a nenhum serviço de música de verdade."""
+    await db.music_connections.update_one(
+        {"member_id": user["id"]},
+        {"$set": {"member_id": user["id"], "provider": data.provider, "connected": False, "requested_at": now_iso()}},
+        upsert=True,
+    )
+    return {"ok": True, "detail": "Integração ainda não disponível — estrutura reservada para quando a API do provedor for habilitada."}
 
 
 # Include router
